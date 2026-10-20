@@ -1,55 +1,85 @@
-# dsh-commandcode-go-provider
+# dsh-commandcode-provider-optimized
 
-Command Code Go API provider for dsh.
+Command Code API provider for dsh — optimized fork of [jiesou/dsh-commandcode-go-provider](https://github.com/jiesou/dsh-commandcode-go-provider).
 
 [简体中文](README.md)
 
+## Background
+
 Command Code subscriptions come in two flavors:
 
-1. **Provider API**: standard OpenAI-compatible endpoints that plug into any agent harness directly, no third-party plugin needed.
-2. **Go / GOAT / Pro Plan**: calling the Provider API returns `403 upgrade_required`; these plans can only be used through Command Code's private CLI gateway `/alpha/generate` (vendor lock-in).
+1. **Provider API**: standard OpenAI-compatible endpoints that plug into any agent harness directly.
+2. **Go / GOAT / Pro / Max Plan**: the Provider API answers `403 upgrade_required`; these plans only work through Command Code's private CLI gateway `/alpha/generate`.
 
-This plugin solves the second case: it streams over `/alpha/generate` through DSH's native `LlmAdapter`, letting Go / GOAT / Pro Plan users use their subscribed models directly inside DSH. Models are **never hardcoded** — on startup the plugin fetches the live catalog from `/provider/v1/models` and filters it by the `Min plan` column of the official CLI catalog (CDN):
+This plugin covers the second case: it streams over `/alpha/generate` through DSH's native `LlmAdapter`. Models are never hardcoded; the plugin reads the client view of the catalog, the same listing the official CLI uses:
 
-- Only models whose `Min plan` is **Go and above** are kept (plans order Go < GOAT < Pro < Max), which already covers the premium models Go includes (GPT-5.6 Luna, Grok 4.5, Muse Spark 1.2 Contributor) with no brand list to maintain.
-- The same catalog supplies each model's supported Reasoning Effort levels.
+```text
+GET https://api.commandcode.ai/provider/v1/models?view=client
+```
+
+Beyond `id` / `context_length`, that view discloses:
+
+- `minimumPlan`: the lowest plan that includes the model. Plans are ordered **Go < GOAT < Pro < Max** and higher plans include the lower tiers.
+- `hidden`: models the service keeps out of clients.
+- `reasoningEfforts` / `inputModalities` / `maxOutputTokens`: effort selectors, modalities, and output cap.
+
+Plan membership and model capabilities therefore come from the API itself; the CLI's build-time `reference/models.md` is only a fallback.
+
+## Changes from upstream
+
+- **Catalog source is `?view=client`**: no more intersecting with the build-time `models.md`. Models shipped before the next CLI release (e.g. `minimax/minimax-m3.1-flash`, `reflection/beam:free`) were silently dropped upstream; here they appear immediately.
+- **Go + GOAT by default**: configurable via `plans`, default `['individual-go', 'individual-goat']`. Add `individual-pro` / `individual-max` to serve higher tiers.
+- **Refresh after scan**: the GUI loads its model catalog once on mount and rebuilds it only on `llm/adapters-updated`. Upstream just logged the finished scan, so a catalog loaded before the scan stayed stale until restart. This fork re-registers its routes to emit the event, plus one delayed re-announce 15s later.
+- **Retry + periodic rescan**: failed scans retry with 15s → 5min exponential backoff; successful scans repeat every 30 minutes.
+- **Modalities / efforts straight from the API**: the `TEXT_ONLY_MODELS` denylist is only used by the fallback path.
+- **Diagnostic status file**: every scan writes `~/.dsh/commandcode-go-provider-status.json`.
 
 ## Install
 
-From npm (prebuilt, recommended):
+From this repository:
 
 ```sh
-dsh plugin --profile web add @jiesou/dsh-commandcode-go-provider
+dsh plugin --profile desktop add github:M1zukiqwq/dsh-commandcode-provider-optimized
 ```
 
-Or from GitHub:
+Or add the dependency and bundle name to the profile manifest:
 
-```sh
-dsh plugin --profile web add github:jiesou/dsh-commandcode-go-provider
-```
-
-Your Command Code API key should be written to `~/.dsh/.credentials.yaml`:
-
-```sh
-echo 'COMMANDCODE_API_KEY: [your key, be like user_xxxx]' >> ~/.dsh/.credentials.yaml
+```json
+{
+  "dependencies": {
+    "@m1zukiqwq/dsh-commandcode-provider-optimized": "github:M1zukiqwq/dsh-commandcode-provider-optimized"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app",
+        "@m1zukiqwq/dsh-commandcode-provider-optimized"
+      ]
+    }
+  }
+}
 ```
 
 ## After installing
 
-Store your API key through DSH's credentials service (written by the web Models page).
+Store the API key through DSH's credentials service (the web Models page), or in `~/.dsh/.credentials.yaml`:
 
-No model config is needed — on startup the plugin syncs the models included in your Go plan from `/provider/v1/models`, and merges per-model Reasoning Effort support from the official CLI catalog (CDN). After install, just pick the Command Code Go provider and a model in the web Models page. If the upstream is unreachable at mount the plugin still comes up with an empty catalog — one network blip never takes the model surface down.
+```sh
+echo 'COMMANDCODE_API_KEY: user_xxxx' >> ~/.dsh/.credentials.yaml
+```
+
+No model config is needed. Pick the **Command Code Go** provider and a model in the Models page.
 
 ### Configuration
 
-All fields optional, defaults work out of the box:
-
 ```yaml
 - id: commandcode-go-provider
-  name: '@jiesou/dsh-commandcode-go-provider'
+  name: '@m1zukiqwq/dsh-commandcode-provider-optimized'
   config:
     apiKeyEnv: COMMANDCODE_API_KEY
     baseURL: https://api.commandcode.ai
+    plans: individual-go,individual-goat
     maxTokens: 64000
     defaultContextWindow: 1000000
     maxRequestImageBytes: 2097152
@@ -57,21 +87,22 @@ All fields optional, defaults work out of the box:
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `apiKeyEnv` | `string` | `"COMMANDCODE_API_KEY"` | Env var name (or credential ref) holding the API key |
-| `baseURL` | `string` | `"https://api.commandcode.ai"` | Command Code gateway base URL; `/alpha/generate` is appended |
+| `apiKeyEnv` | `string` | `"COMMANDCODE_API_KEY"` | Credential ref (or env var name) holding the API key |
+| `baseURL` | `string` | `"https://api.commandcode.ai"` | Gateway base URL; `/alpha/generate` is appended |
+| `plans` | `string` | `"individual-go,individual-goat"` | Comma-separated client-catalog plan ids to serve; order Go < GOAT < Pro < Max |
 | `maxTokens` | `number` | `64000` | Per-request output token cap |
-| `defaultContextWindow` | `number` | `1000000` | Fallback context capacity when a model has no exact value |
+| `defaultContextWindow` | `number` | `1000000` | Fallback context capacity |
 | `maxRequestImageBytes` | `number` | `2097152` (2 MiB) | Inline base64 image budget for one request |
-| `accounts` | `object` | `{}` | Multi-account dictionary: each key is an independent provider route. Absent or empty = single-account mode driven by the top-level fields |
-| `http1` | `boolean` | `false` | Send gateway requests over HTTP/1.1. Node ≥ 26 negotiates HTTP/2 for `fetch` and multiplexes everything onto one connection; the gateway's edge (Cloudflare) resets streams with `ENHANCE_YOUR_CALM` under that concurrency. HTTP/1.1 turns the same limit into a readable 429 |
+| `accounts` | `object` | `{}` | Multi-account dictionary: each key is an independent provider route |
+| `http1` | `boolean` | `false` | Send gateway traffic over HTTP/1.1 (avoids HTTP/2 edge resets) |
 
 ### Multiple accounts
 
-The `accounts` dictionary exposes several accounts of the same Go plan as several independent providers (each gets its own entry in the model picker and holds its own API key). Every account field falls back to the top-level field of the same name; `displayName` defaults to the account key:
+`accounts` exposes several accounts as independent providers (each with its own picker entry and key). Every account field falls back to the top-level field of the same name:
 
 ```yaml
 - id: commandcode-go-provider
-  name: '@jiesou/dsh-commandcode-go-provider'
+  name: '@m1zukiqwq/dsh-commandcode-provider-optimized'
   config:
     accounts:
       commandcode-1:
@@ -81,55 +112,59 @@ The `accounts` dictionary exposes several accounts of the same Go plan as severa
         displayName: Command Code Go 2
         apiKeyEnv: COMMANDCODE_API_KEY_2
     baseURL: https://api.commandcode.ai
-    retryPolicy:
-      mode: always
 ```
 
 | Account field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `displayName` | `string` | account key | Label shown in the model picker |
-| `apiKeyEnv` | `string` | top-level `apiKeyEnv` | Credential ref for this account, written through its card on the web Models page |
+| `displayName` | `string` | account key | Label in the model picker |
+| `apiKeyEnv` | `string` | top-level `apiKeyEnv` | Credential ref for this account |
 | `baseURL` | `string` | top-level `baseURL` | Per-account gateway override |
-| `maxTokens` | `number` | top-level `maxTokens` | Per-account output cap override |
-| `defaultContextWindow` | `number` | top-level `defaultContextWindow` | Per-account fallback capacity override |
-| `maxRequestImageBytes` | `number` | top-level `maxRequestImageBytes` | Per-account image budget override |
-| `retryPolicy` | `object` | top-level `retryPolicy` | Per-account retry policy override |
+| `maxTokens` | `number` | top-level `maxTokens` | Per-account output cap |
+| `defaultContextWindow` | `number` | top-level `defaultContextWindow` | Per-account fallback capacity |
+| `maxRequestImageBytes` | `number` | top-level `maxRequestImageBytes` | Per-account image budget |
+| `retryPolicy` | `object` | top-level `retryPolicy` | Per-account retry policy |
 
-The model catalog is scanned once and shared by every account; settings changes apply to the next request without a restart. Empty or remove `accounts` to go back to the single-account shape.
+The scanned catalog is shared by every account.
 
-Reasoning effort needs no configuration: levels come from the official CLI catalog, and a model exposes exactly the levels it accepts (`low`/`medium`/`high`/`xhigh`/`max`), plus an explicit `Off` entry. **Default** means "do not send `reasoning_effort`" — the gateway decides the depth. **Off** is the same wire shape as Default but pins the intent explicitly. A model the catalog leaves blank shows no level selector at all.
+### Reasoning effort
+
+Levels come from the client catalog's `reasoningEfforts`; a model exposes exactly the levels it accepts (`low` / `medium` / `high` / `xhigh` / `max`) plus an explicit `Off`. **Default** means "do not send `reasoning_effort`". A model without disclosed levels shows no selector.
 
 ## Images
 
-`/alpha/generate` is stateless: the gateway stores no image and exposes no upload endpoint (the official CLI also re-sends every historical image inline on every turn). So this plugin follows the DSH route standard:
+`/alpha/generate` is stateless: no stored images and no upload endpoint (the official CLI also re-sends every historical image inline each turn). The plugin follows the DSH route standard:
 
 - Each image is re-encoded to fit 1 MiB (under a 2048×2048 pixel budget).
-- When the inline base64 images of one request exceed `maxRequestImageBytes` (default 2 MiB), no request is sent; the adapter throws `IMAGE_OFFLOAD_REQUIRED` naming how many occurrences must be offloaded. DSH records the **oldest** ones in an `image/offload` event and retries; from then on their bytes are replaced by placeholder text that still names the image identity and a readable path.
-- An offloaded image is never read, encoded, or uploaded again.
+- When inline base64 images exceed `maxRequestImageBytes` (default 2 MiB), the adapter throws `IMAGE_OFFLOAD_REQUIRED` naming how many occurrences to offload; DSH records the oldest ones and retries with placeholder text.
+- Offloaded images are never read, encoded, or uploaded again.
 
-Both values count base64 characters (about 4/3 of the raw bytes). The default pair holds one full-size image plus one half-size image: lower them to save more bandwidth, raise them to keep more images visible to the model. Keep `maxRequestImageBytes` above one image's base64 length (a 1 MiB image is ~1.4 MB), or not even one image fits.
+## Diagnostics
+
+Every scan writes `~/.dsh/commandcode-go-provider-status.json`:
+
+```json
+{
+  "ok": true,
+  "source": "client",
+  "announced": "ok",
+  "count": 69,
+  "ids": ["..."]
+}
+```
+
+- `source: "fallback"`: the client view was unreachable and `models.md` was used.
+- `announced` other than `ok`: the refresh event failed to send.
+- `ok: false`: carries an `error` field.
 
 ## Compatibility
 
-Declared in `package.json` under `dsh.compatibility`: DSH `>=0.1.7-alpha.1 <0.2.0`, Node.js `^22.19.0 || >=24.0.0`, profiles `web` / `headless`.
+Declared in `package.json` under `dsh.compatibility`: DSH `>=0.2.0-rc.2 <0.3`, Node.js `^22.19.0 || >=24.0.0`, profiles `web` / `headless` / `desktop`.
 
-`>=0.1.7-alpha.1` is a hard floor, not a preference: that release made dsh-llm carry tool results as first-class `role: 'tool'` messages (`toolCallId` moved to the message) and rewrote the dsh-settings form model (`installSection` replaced by `SettingsForms`, and a config field only appears on the settings page once it is marked `volatile()`). This plugin implements the new model; the pre-0.1.7 `role: 'user'` + `tool-result` block shape is no longer supported.
-
-Per-release evidence (each release installed into a disposable profile with `dsh plugin add <tarball>`, cold-started until it issued a real request, then uninstalled):
-
-| DSH version | install | start | uninstall |
-| --- | --- | --- | --- |
-| 0.1.7-rc.2 | passed | passed | passed |
-
-0.1.7-alpha.1 / alpha.2 / rc.1 meet the declared floor but were not each verified end to end.
-
-Reproduce with `DSH_HOME=<empty dir> dsh --profile compat --from-default-profile headless`, add that release's `@deepseek-ai/dsh-base` and the plugin tarball, check the plugin row in `dsh --profile compat --dump-config`, cold-start a real gateway request to exercise the provider and its model catalog, then `dsh plugin --profile compat remove` and confirm the profile still boots.
+Verified on DSH `0.2.1-rc.2` (Desktop): mount, client catalog scan, Go + GOAT filtering, and the refresh event all pass, with 69 models (58 Go + 11 GOAT).
 
 ## Credit
 
-Port of [brent-weatherall/opencode-commandcode-provider](https://github.com/brent-weatherall/opencode-commandcode-provider) to DSH.
-
-This plugin adds dynamic reasoning effort extraction, parsed from <https://unpkg.com/command-code@latest/dist/bundled/command-code-knowledge/reference/models.md>.
+Upstream: [jiesou/dsh-commandcode-go-provider](https://github.com/jiesou/dsh-commandcode-go-provider), a port of [brent-weatherall/opencode-commandcode-provider](https://github.com/brent-weatherall/opencode-commandcode-provider).
 
 ## License
 

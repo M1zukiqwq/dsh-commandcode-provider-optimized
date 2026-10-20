@@ -6,12 +6,13 @@
  * so every request must go through Command Code's private CLI gateway at
  * `/alpha/generate`. This plugin:
  *
- * 1. Scans the public model catalog (`/provider/v1/models`, open endpoint) and
- *    keeps the models the Go plan includes (open-source plus GPT-5.6 Luna,
- *    Grok 4.5, Muse Spark 1.2 Contributor), re-scanning on an interval. The
- *    Provider API discloses no reasoning metadata, so per-model effort support
- *    is merged from the official `command-code` CLI catalog
- *    (`reference/models.md`, fetched live from the published npm package).
+ * 1. Reads the client view of the model catalog
+ *    (`/provider/v1/models?view=client`, the same listing the official CLI
+ *    reads) and keeps every visible model the configured plans (default Go and
+ *    GOAT) include, taking reasoning efforts and input modalities from the same
+ *    rows. The CLI's build-time `reference/models.md` is only a fallback, and
+ *    the catalog is re-scanned on an interval, so a newly shipped model appears
+ *    without a restart.
  * 2. Registers one configurable provider route per configured account (the
  *    `accounts` dictionary; a single default account when it is absent) whose
  *    adapter streams over `/alpha/generate`, so the harness model picker,
@@ -23,6 +24,9 @@
  * @module dsh-commandcode-go-provider
  */
 
+import { writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { assertUsableApiKey, errorChain, LlmError, resolveImageAttachmentAccess, resolveRetryPolicy, RetryPolicySchema } from '@deepseek-ai/dsh-llm'
@@ -34,7 +38,8 @@ import { deepEqualJson } from '@deepseek-ai/dsh-util-values'
 import type {} from '@deepseek-ai/cordis-plugin-loader'
 import { CommandCodeGoAdapter, DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_REQUEST_IMAGE_BYTES, DEFAULT_MAX_TOKENS, DEFAULT_STREAM_IDLE_TIMEOUT_MS } from './adapter.js'
 import type { CommandCodeGoConnectionOptions, CommandCodeGoModel } from './adapter.js'
-import { fetchCatalog, fetchGoModels } from './models.js'
+import { DEFAULT_SERVED_PLANS, fetchCatalog, fetchClientModels, fetchGoModels } from './models.js'
+import type { GoModel } from './models.js'
 
 export {
   CommandCodeGoAdapter,
@@ -44,8 +49,17 @@ export {
   DEFAULT_STREAM_IDLE_TIMEOUT_MS,
 } from './adapter.js'
 export type { CommandCodeGoAdapterOptions, CommandCodeGoConnectionOptions, CommandCodeGoModel } from './adapter.js'
-export { fetchCatalog, fetchGoModels, imageCapable, isGoPlan, parseCatalog } from './models.js'
-export type { CatalogEntry, GoModel } from './models.js'
+export {
+  DEFAULT_SERVED_PLANS,
+  fetchCatalog,
+  fetchClientModels,
+  fetchGoModels,
+  imageCapable,
+  isGoPlan,
+  isServedPlan,
+  parseCatalog,
+} from './models.js'
+export type { CatalogEntry, ClientCatalogOptions, GoModel } from './models.js'
 export { chunkState } from './protocol.js'
 export type { ChunkState } from './protocol.js'
 
@@ -104,6 +118,13 @@ export interface Config {
    * as offloaded and retries. Also every account's default.
    */
   maxRequestImageBytes?: number
+  /**
+   * Comma-separated client-catalog plan ids to serve (default
+   * `individual-go,individual-goat`). Plans are ordered Go < GOAT < Pro < Max
+   * and each includes the tiers below it, so add `individual-pro` or
+   * `individual-max` to serve those plans too.
+   */
+  plans?: string
   /** Provider-owned model-request retry policy; omission uses normal defaults. Also every account's default. */
   retryPolicy?: RetryPolicyConfig
   /**
@@ -132,6 +153,7 @@ export const Config = z.object({
   maxTokens: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).default(DEFAULT_MAX_TOKENS).volatile(),
   defaultContextWindow: z.number().step(1).min(1).default(DEFAULT_CONTEXT_WINDOW).volatile(),
   maxRequestImageBytes: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).default(DEFAULT_MAX_REQUEST_IMAGE_BYTES).volatile(),
+  plans: z.string().default(DEFAULT_SERVED_PLANS.join(',')).volatile(),
   retryPolicy: RetryPolicySchema.volatile(),
   http1: z.boolean().default(false).volatile(),
 })
@@ -156,6 +178,7 @@ function liveConfig(config: LiveConfig): Config {
     maxTokens: config.maxTokens.get(),
     defaultContextWindow: config.defaultContextWindow.get(),
     maxRequestImageBytes: config.maxRequestImageBytes.get(),
+    plans: config.plans.get(),
     retryPolicy: config.retryPolicy.get(),
     http1: config.http1.get(),
   }) as Config
@@ -339,22 +362,104 @@ export function apply(ctx: Context, config: LiveConfig): void {
     }
   })
 
-  /** Scan the Go catalog and swap it into the adapter's view. */
-  async function sync(): Promise<void> {
-    // The official CLI catalog owns the two facts the Provider API withholds:
-    // which plan each model belongs to, and which reasoning efforts it takes.
-    // Without it there is no honest Go filter, so a failed scan keeps the
-    // previous catalog instead of guessing plan membership.
-    const next = await fetchGoModels(await fetchCatalog())
-    if (next.length === 0) {
-      throw new Error('no Go models found; keeping the previous catalog')
+  /**
+   * Best-effort record of the last scan, so a missing model can be told apart
+   * from a catalog that never loaded without attaching a debugger.
+   */
+  const STATUS_FILE = join(homedir(), '.dsh', 'commandcode-go-provider-status.json')
+  const recordStatus = (facts: Record<string, unknown>): void => {
+    try {
+      writeFileSync(STATUS_FILE, JSON.stringify(facts, null, 2) + '\n')
+    } catch {
+      // Diagnostics must never break the provider.
     }
-    if (deepEqualJson(next, scanned)) return
-    scanned = next
-    ctx.logger.info('[commandcode-go-provider] synced %d Go model(s): %s', next.length, next.map(m => m.id).join(', '))
   }
 
-  void sync().catch((error: unknown) => {
-    ctx.logger.warn('[commandcode-go-provider] initial scan failed: %s', errorChain(error))
+  /**
+   * Publish a finished scan. The GUI client loads its one model catalog when it
+   * mounts and rebuilds it only on `llm/adapters-updated`, so a catalog that
+   * arrives after that first load would otherwise stay invisible for the life
+   * of the app. Re-registering the same routes is the public way to emit the
+   * event: the LLM service announces every commit, even an unchanged set.
+   */
+  const announce = (): string => {
+    try {
+      ensureRegistrationFacts()
+      ensureDirectory()
+      if (registration !== undefined) registration.replace([...accounts().keys()].sort())
+      return 'ok'
+    } catch (error: unknown) {
+      ctx.logger.warn('[commandcode-go-provider] could not announce the refreshed catalog: %s', errorChain(error))
+      return errorChain(error)
+    }
+  }
+
+  const SCAN_INTERVAL_MS = 30 * 60 * 1000
+  const SCAN_RETRY_MIN_MS = 15 * 1000
+  const SCAN_RETRY_MAX_MS = 5 * 60 * 1000
+  let scanTimer: ReturnType<typeof setTimeout> | undefined
+  let retryDelay = SCAN_RETRY_MIN_MS
+  const scheduleScan = (delay: number): void => {
+    scanTimer = setTimeout(runScan, delay)
+    // A pending re-scan must not hold the process open on shutdown.
+    scanTimer.unref?.()
+  }
+
+  /** Scan the served-plan catalog and swap it into the adapter's view. */
+  async function sync(): Promise<'client' | 'fallback'> {
+    // The client view first: it carries plan membership, efforts, and
+    // modalities, so the filter no longer depends on the CLI's build-time
+    // reference, which lags every model the service ships after a release.
+    let source: 'client' | 'fallback' = 'client'
+    let next: GoModel[]
+    try {
+      const plans = config.plans.get().split(',').map(part => part.trim()).filter(part => part.length > 0)
+      next = await fetchClientModels({ plans })
+    } catch (error: unknown) {
+      source = 'fallback'
+      ctx.logger.warn('[commandcode-go-provider] client catalog unavailable (%s); falling back to the published CLI reference', errorChain(error))
+      next = await fetchGoModels(await fetchCatalog())
+    }
+    if (next.length === 0) {
+      throw new Error('no models found; keeping the previous catalog')
+    }
+    if (deepEqualJson(next, scanned)) return source
+    scanned = next
+    ctx.logger.info('[commandcode-go-provider] synced %d model(s) via %s: %s', next.length, source, next.map(m => m.id).join(', '))
+    return source
+  }
+
+  const runScan = (): void => {
+    scanTimer = undefined
+    void sync().then((source) => {
+      retryDelay = SCAN_RETRY_MIN_MS
+      const announced = announce()
+      recordStatus({
+        at: new Date().toISOString(),
+        ok: true,
+        source,
+        announced,
+        count: scanned.length,
+        ids: scanned.map(model => model.id),
+      })
+      // One more poke for a client whose subscription landed just after the event.
+      setTimeout(() => announce(), 15_000).unref?.()
+      scheduleScan(SCAN_INTERVAL_MS)
+    }, (error: unknown) => {
+      recordStatus({ at: new Date().toISOString(), ok: false, error: errorChain(error), count: scanned.length })
+      ctx.logger.warn('[commandcode-go-provider] catalog scan failed; retrying in %dms: %s', retryDelay, errorChain(error))
+      scheduleScan(retryDelay)
+      retryDelay = Math.min(retryDelay * 2, SCAN_RETRY_MAX_MS)
+    })
+  }
+
+  // A pending re-scan must not outlive the plugin.
+  ctx.effect(() => () => {
+    if (scanTimer !== undefined) {
+      clearTimeout(scanTimer)
+      scanTimer = undefined
+    }
   })
+
+  runScan()
 }

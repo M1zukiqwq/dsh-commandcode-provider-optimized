@@ -6,12 +6,13 @@
  * so every request must go through Command Code's private CLI gateway at
  * `/alpha/generate`. This plugin:
  *
- * 1. Scans the public model catalog (`/provider/v1/models`, open endpoint) and
- *    keeps the models the Go plan includes (open-source plus GPT-5.6 Luna,
- *    Grok 4.5, Muse Spark 1.2 Contributor), re-scanning on an interval. The
- *    Provider API discloses no reasoning metadata, so per-model effort support
- *    is merged from the official `command-code` CLI catalog
- *    (`reference/models.md`, fetched live from the published npm package).
+ * 1. Reads the client view of the model catalog
+ *    (`/provider/v1/models?view=client`, the same listing the official CLI
+ *    reads) and keeps every visible model the configured plans (default Go and
+ *    GOAT) include, taking reasoning efforts and input modalities from the same
+ *    rows. The CLI's build-time `reference/models.md` is only a fallback, and
+ *    the catalog is re-scanned on an interval, so a newly shipped model appears
+ *    without a restart.
  * 2. Registers one configurable provider route per configured account (the
  *    `accounts` dictionary; a single default account when it is absent) whose
  *    adapter streams over `/alpha/generate`, so the harness model picker,
@@ -28,8 +29,8 @@ import type { RetryPolicyConfig } from '@deepseek-ai/dsh-llm';
 import type { CommandCodeGoConnectionOptions, CommandCodeGoModel } from './adapter.js';
 export { CommandCodeGoAdapter, DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_REQUEST_IMAGE_BYTES, DEFAULT_MAX_TOKENS, DEFAULT_STREAM_IDLE_TIMEOUT_MS, } from './adapter.js';
 export type { CommandCodeGoAdapterOptions, CommandCodeGoConnectionOptions, CommandCodeGoModel } from './adapter.js';
-export { fetchCatalog, fetchGoModels, imageCapable, isGoPlan, parseCatalog } from './models.js';
-export type { CatalogEntry, GoModel } from './models.js';
+export { DEFAULT_SERVED_PLANS, fetchCatalog, fetchClientModels, fetchGoModels, imageCapable, isGoPlan, isServedPlan, parseCatalog, } from './models.js';
+export type { CatalogEntry, ClientCatalogOptions, GoModel } from './models.js';
 export { chunkState } from './protocol.js';
 export type { ChunkState } from './protocol.js';
 export declare const name = "commandcode-go-provider";
@@ -77,6 +78,13 @@ export interface Config {
      * as offloaded and retries. Also every account's default.
      */
     maxRequestImageBytes?: number;
+    /**
+     * Comma-separated client-catalog plan ids to serve (default
+     * `individual-go,individual-goat`). Plans are ordered Go < GOAT < Pro < Max
+     * and each includes the tiers below it, so add `individual-pro` or
+     * `individual-max` to serve those plans too.
+     */
+    plans?: string;
     /** Provider-owned model-request retry policy; omission uses normal defaults. Also every account's default. */
     retryPolicy?: RetryPolicyConfig;
     /**
@@ -95,6 +103,7 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
     maxTokens: z<number, number, "volatile-defined">;
     defaultContextWindow: z<number, number, "volatile-defined">;
     maxRequestImageBytes: z<number, number, "volatile-defined">;
+    plans: z<string, string, "volatile-defined">;
     retryPolicy: z<NoInfer<RetryPolicyConfig>, NoInfer<RetryPolicyConfig>, "volatile">;
     http1: z<boolean, boolean, "volatile-defined">;
 }>>, Schemastery.ObjectT<NoInfer<{
@@ -104,6 +113,7 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
     maxTokens: z<number, number, "volatile-defined">;
     defaultContextWindow: z<number, number, "volatile-defined">;
     maxRequestImageBytes: z<number, number, "volatile-defined">;
+    plans: z<string, string, "volatile-defined">;
     retryPolicy: z<NoInfer<RetryPolicyConfig>, NoInfer<RetryPolicyConfig>, "volatile">;
     http1: z<boolean, boolean, "volatile-defined">;
 }>>, "plain">;

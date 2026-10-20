@@ -1,31 +1,36 @@
 /**
- * Command Code Go model discovery: pull the live catalog from the public
- * `/provider/v1/models` endpoint and keep only the models a Go-plan
- * subscription can actually call.
+ * Command Code model discovery.
  *
- * The listing endpoint is open (no auth required, and a Go key would be
- * refused here anyway — Go has no Provider-API access). It discloses only
- * `id` / `name` / `context_length`: neither plan membership nor reasoning
- * support is part of the Provider API. Both come from the model catalog the
- * official `command-code` CLI ships (`dist/bundled/command-code-knowledge/
- * reference/models.md`), fetched live from the published npm package so it
- * tracks the `latest` release instead of a checked-in snapshot.
+ * The authoritative source is the client view of the model catalog
+ * (`/provider/v1/models?view=client`), the same listing the official
+ * `command-code` CLI reads. Besides `id` and `context_length` it discloses
+ * the facts the bare Provider API withholds:
  *
- * Go membership is therefore read, not guessed: the catalog's `Min plan`
- * column names the lowest plan each model belongs to (`Go and above`, `Pro
- * and above`, `GOAT and above`, `Max`), which covers the premium models Go
- * includes outright without a hand-maintained exception list.
+ * - `minimumPlan`: the lowest plan that includes the model. Plans are ordered
+ *   Go < GOAT < Pro < Max and every higher plan includes the models below it,
+ *   so serving a plan means keeping every model whose `minimumPlan` is at or
+ *   below it.
+ * - `hidden`: models the service itself hides from clients.
+ * - `reasoningEfforts` / `inputModalities`: the per-model effort selectors and
+ *   whether the model accepts image input.
  *
- * @module dsh-commandcode-go-provider/models
+ * The older path — the `Min plan` and effort columns of the CLI's build-time
+ * `reference/models.md`, intersected with the plain listing — remains as a
+ * fallback only: that reference lags every model the service ships after the
+ * CLI release, which hides new models until the next CLI build.
+ *
+ * @module dsh-commandcode-provider-optimized/models
  */
 
 export interface GoModel {
   id: string
   name: string
   contextWindow: number
+  /** Per-request output cap, when the client catalog discloses one. */
+  maxTokens?: number
   /** Reasoning-effort ids the gateway accepts for this model, in display order. */
   efforts?: string[]
-  /** Whether the model accepts image input per the official CLI's own vision data. */
+  /** Whether the model accepts image input; falls back to the CLI's text-only denylist when undisclosed. */
   imageInput: boolean
 }
 
@@ -89,12 +94,24 @@ export function isGoPlan(entry: CatalogEntry | undefined): boolean {
 
 /**
  * The listing reuses one display name across the paid and free tier of the
- * same model (`MiniMaxAI/MiniMax-M3` and `minimax/minimax-m3-free` are both
- * "MiniMax M3"). Free tiers are marked by a `-free` id suffix, so surface that
- * in the name to keep the two apart.
+ * same model (`MiniMaxAI/MiniMax-M3` and `minimax/minimax-m3.1-flash:free`
+ * are both "MiniMax M3.1 Flash"). Free tiers are marked by a `:free` (client
+ * catalog) or `-free` id suffix, so surface that in the name to keep the two
+ * apart.
  */
 export function displayName(id: string, name: string): string {
-  return id.endsWith('-free') && !/free/i.test(name) ? `${name} (free)` : name
+  const freeTier = id.endsWith(':free') || id.endsWith('-free')
+  return freeTier && !/free/i.test(name) ? `${name} (free)` : name
+}
+
+/** Plan ids served by default: Go plus GOAT (plans are ordered Go < GOAT < Pro < Max). */
+export const DEFAULT_SERVED_PLANS: readonly string[] = ['individual-go', 'individual-goat']
+
+const SERVED_PLANS: ReadonlySet<string> = new Set(DEFAULT_SERVED_PLANS)
+
+/** Whether a client-catalog `minimumPlan` is in the served plan set. */
+export function isServedPlan(plan: unknown, plans: ReadonlySet<string> = SERVED_PLANS): boolean {
+  return typeof plan === 'string' && plans.has(plan)
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -206,6 +223,72 @@ export async function fetchGoModels(
     })
   }
   // Stable order keeps the diff against a persisted catalog deterministic.
+  models.sort((a, b) => a.id.localeCompare(b.id))
+  return models
+}
+
+const CLIENT_MODELS_URL = 'https://api.commandcode.ai/provider/v1/models?view=client'
+
+/** Narrow one client-catalog row onto the adapter's model shape, or drop it. */
+function clientModel(raw: Record<string, unknown>, plans: ReadonlySet<string>): GoModel | undefined {
+  // Hidden rows are ones the service itself keeps out of clients, and a row
+  // without a served `minimumPlan` cannot be shown to belong to this tier.
+  if (raw.hidden === true) return undefined
+  const id = nonEmptyString(raw.id)
+  if (id === undefined || !isServedPlan(raw.minimumPlan, plans)) return undefined
+  const display = isRecord(raw.display) ? raw.display : undefined
+  const label = nonEmptyString(display?.label)
+  const name = displayName(id, label ?? nonEmptyString(raw.name) ?? id.split('/').pop() ?? id)
+  const maxTokens = positiveNumber(raw.maxOutputTokens)
+  const efforts = Array.isArray(raw.reasoningEfforts)
+    ? raw.reasoningEfforts.filter((part): part is string => typeof part === 'string' && part.length > 0)
+    : []
+  const modalities = Array.isArray(raw.inputModalities) ? raw.inputModalities : undefined
+  return {
+    id,
+    name,
+    contextWindow: positiveNumber(raw.context_length) ?? FALLBACK_CONTEXT_WINDOW,
+    imageInput: modalities === undefined ? imageCapable(id) : modalities.includes('image'),
+    ...maxTokens === undefined ? {} : { maxTokens },
+    ...efforts.length === 0 ? {} : { efforts },
+  }
+}
+
+/** Options for {@link fetchClientModels}. */
+export interface ClientCatalogOptions {
+  /** Plan ids to serve; defaults to {@link DEFAULT_SERVED_PLANS}. */
+  plans?: readonly string[]
+  /** Override the client-view endpoint (tests). */
+  url?: string
+  /** Override the fetch implementation (tests). */
+  fetchImpl?: typeof fetch
+}
+
+/**
+ * Fetch the client-view catalog and keep every visible model the served plans
+ * include. This is the primary scan: it needs no build-time reference and
+ * therefore sees a model the moment the service lists it.
+ */
+export async function fetchClientModels(options: ClientCatalogOptions = {}): Promise<GoModel[]> {
+  const { plans = DEFAULT_SERVED_PLANS, url = CLIENT_MODELS_URL, fetchImpl = fetch } = options
+  const served = new Set(plans)
+  const response = await fetchImpl(url, {
+    headers: { accept: 'application/json' },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  })
+  if (!response.ok) {
+    throw new Error(`Command Code client catalog answered HTTP ${response.status}`)
+  }
+  const payload: unknown = await response.json()
+  if (!isRecord(payload) || !Array.isArray(payload.data)) {
+    throw new Error('Command Code client catalog returned an unexpected shape')
+  }
+  const models: GoModel[] = []
+  for (const raw of payload.data) {
+    if (!isRecord(raw)) continue
+    const model = clientModel(raw, served)
+    if (model !== undefined) models.push(model)
+  }
   models.sort((a, b) => a.id.localeCompare(b.id))
   return models
 }
