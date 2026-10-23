@@ -80,7 +80,7 @@ echo 'COMMANDCODE_API_KEY: user_xxxx' >> ~/.dsh/.credentials.yaml
     apiKeyEnv: COMMANDCODE_API_KEY
     baseURL: https://api.commandcode.ai
     plans: individual-go,individual-goat
-    maxTokens: 64000
+    maxTokens: 200000
     defaultContextWindow: 1000000
     maxRequestImageBytes: 2097152
 ```
@@ -90,11 +90,13 @@ echo 'COMMANDCODE_API_KEY: user_xxxx' >> ~/.dsh/.credentials.yaml
 | `apiKeyEnv` | `string` | `"COMMANDCODE_API_KEY"` | 读取 API Key 的环境变量名（或 credential ref） |
 | `baseURL` | `string` | `"https://api.commandcode.ai"` | 网关 base URL，`/alpha/generate` 自动追加 |
 | `plans` | `string` | `"individual-go,individual-goat"` | 逗号分隔的 client catalog 套餐 id；顺序 Go < GOAT < Pro < Max |
-| `maxTokens` | `number` | `64000` | 单次请求输出 token 上限 |
+| `maxTokens` | `number` | `200000` | 单次请求输出 token 上限（网关硬上限；思维链 token 也计入） |
 | `defaultContextWindow` | `number` | `1000000` | 模型无精确 contextWindow 时的兜底值 |
 | `maxRequestImageBytes` | `number` | `2097152`（2 MiB） | 单次请求允许内联的 base64 图片字节上限 |
 | `accounts` | `object` | `{}` | 多账号字典：每个 key 是独立 provider 路由 |
 | `http1` | `boolean` | `false` | 用 HTTP/1.1 发网关请求，避免 HTTP/2 并发被 Cloudflare 重置 |
+
+> **输出预算**：`max_tokens` 同时限制正文和思维链。目录行未给 `maxOutputTokens` 的模型回退到 `maxTokens`（默认 200000，即网关硬上限）；预算过小时，长思维链会把它全部吃完，表现为 `finish_reason: length` / DSH 的 "Output token limit reached"。
 
 ### 多账号
 

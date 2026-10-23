@@ -27,8 +27,13 @@ import type { ImageAttachmentRef, RequestImageAttachment } from '@deepseek-ai/ds
  * this is what `command-code@latest` ships.
  */
 export declare const CC_VERSION = "1.74.0";
-/** Last-resort output cap when a request carries no maxTokens (matches the adapter default). */
-export declare const DEFAULT_MAX_TOKENS = 64000;
+/**
+ * Last-resort output cap when a request carries no maxTokens (matches the
+ * adapter default). 200,000 is the gateway's hard ceiling: most catalog rows
+ * omit `maxOutputTokens`, and reasoning tokens share this same budget, so the
+ * previous 64,000 cap truncated thinking-only turns.
+ */
+export declare const DEFAULT_MAX_TOKENS = 200000;
 /**
  * Reasoning-effort values the gateway accepts (the CLI's own
  * `isReasoningEffort` list), mapped to their selector labels. There is

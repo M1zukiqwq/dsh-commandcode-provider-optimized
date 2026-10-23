@@ -106,7 +106,7 @@ export interface Config {
   apiKeyEnv?: string
   /** Gateway base URL; defaults to `https://api.commandcode.ai`. Also every account's default. */
   baseURL?: string
-  /** Default per-request output cap (default 64,000); explicit request values win. Also every account's default. */
+  /** Default per-request output cap (default 200,000); explicit request values win. Also every account's default. */
   maxTokens?: number
   /** Positive context capacity used when the selected model has no exact value (default 1,000,000). Also every account's default. */
   defaultContextWindow?: number

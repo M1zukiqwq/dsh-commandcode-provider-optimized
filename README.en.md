@@ -80,7 +80,7 @@ No model config is needed. Pick the **Command Code Go** provider and a model in 
     apiKeyEnv: COMMANDCODE_API_KEY
     baseURL: https://api.commandcode.ai
     plans: individual-go,individual-goat
-    maxTokens: 64000
+    maxTokens: 200000
     defaultContextWindow: 1000000
     maxRequestImageBytes: 2097152
 ```
@@ -90,11 +90,13 @@ No model config is needed. Pick the **Command Code Go** provider and a model in 
 | `apiKeyEnv` | `string` | `"COMMANDCODE_API_KEY"` | Credential ref (or env var name) holding the API key |
 | `baseURL` | `string` | `"https://api.commandcode.ai"` | Gateway base URL; `/alpha/generate` is appended |
 | `plans` | `string` | `"individual-go,individual-goat"` | Comma-separated client-catalog plan ids to serve; order Go < GOAT < Pro < Max |
-| `maxTokens` | `number` | `64000` | Per-request output token cap |
+| `maxTokens` | `number` | `200000` | Per-request output token cap (gateway ceiling; reasoning tokens count too) |
 | `defaultContextWindow` | `number` | `1000000` | Fallback context capacity |
 | `maxRequestImageBytes` | `number` | `2097152` (2 MiB) | Inline base64 image budget for one request |
 | `accounts` | `object` | `{}` | Multi-account dictionary: each key is an independent provider route |
 | `http1` | `boolean` | `false` | Send gateway traffic over HTTP/1.1 (avoids HTTP/2 edge resets) |
+
+> **Output budget**: `max_tokens` caps both the reply and the reasoning trace. Models whose catalog row omits `maxOutputTokens` fall back to `maxTokens` (default 200000, the gateway ceiling); a smaller budget can be consumed entirely by a long reasoning trace, surfacing as `finish_reason: length` / DSH's "Output token limit reached".
 
 ### Multiple accounts
 
